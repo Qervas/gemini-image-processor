@@ -1,0 +1,58 @@
+{
+  "prompts": {
+    "default": {
+      "description": "Default sky removal optimized for RealityScan/photogrammetric methods",
+      "prompt": "Remove the sky and clouds from this image and replace them with solid black background. This is for photogrammetric processing and 3D reconstruction. Preserve all buildings, trees, people, vehicles, and ground-level objects completely intact. Set sky areas to pure black (RGB 0,0,0) for clean masking in RealityScan workflows.",
+      "use_case": "photogrammetry",
+      "background_color": "black"
+    },
+    "conservative": {
+      "description": "Conservative approach with minimal sky removal",
+      "prompt": "Carefully remove only the sky from this image, keeping all foreground elements intact. Replace the sky with transparency while maintaining the original lighting and color balance.",
+      "use_case": "safe_removal",
+      "background_color": "transparent"
+    },
+    "aggressive": {
+      "description": "Aggressive sky removal for maximum coverage",
+      "prompt": "Remove the entire sky and any sky-related elements from this image. Replace with transparent background, ensuring clean edges around buildings and natural elements.",
+      "use_case": "maximum_removal",
+      "background_color": "transparent"
+    },
+    "building_preservation": {
+      "description": "Optimized for architectural and building preservation",
+      "prompt": "Remove the sky while carefully preserving all architectural details, windows, and building structures. Replace sky with transparency and maintain realistic lighting on building surfaces.",
+      "use_case": "architecture",
+      "background_color": "transparent"
+    },
+    "urban_scene": {
+      "description": "Specialized for urban environments and city skylines",
+      "prompt": "Remove sky from urban scene, keeping all buildings, vehicles, street elements, and people intact. Replace with transparent background suitable for compositing.",
+      "use_case": "urban_photography",
+      "background_color": "transparent"
+    },
+    "custom_template": {
+      "description": "Template-based prompt with dynamic variables",
+      "prompt": "Analyze this image and remove the sky: {image_description}. Replace the sky with a transparent background while preserving all foreground elements and maintaining natural lighting and colors.",
+      "use_case": "custom",
+      "background_color": "transparent",
+      "variables": ["image_description", "scene_type", "preservation_focus"]
+    }
+  },
+  "settings": {
+    "enable_optimization": true,
+    "max_prompt_length": 500,
+    "language": "english",
+    "default_background_color": "black",
+    "photogrammetry_defaults": {
+      "background_color": "black",
+      "preserve_details": true,
+      "mask_quality": "high"
+    }
+  },
+  "metadata": {
+    "version": "1.0",
+    "model": "gemini-2.5-flash",
+    "created": "2025-09-23",
+    "description": "Prompt configurations for Gemini-powered sky removal optimized for RealityScan photogrammetry"
+  }
+}
