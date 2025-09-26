@@ -14,7 +14,17 @@ from pathlib import Path
 class PromptProcessor:
     """Handles prompt management and processing for Gemini sky removal"""
 
+    _instance = None
+
+    def __new__(cls, prompts_file: str = "prompts.json"):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self, prompts_file: str = "prompts.json"):
+        if hasattr(self, '_initialized'):
+            return
+        self._initialized = True
         self.prompts_file = Path(prompts_file)
         self.prompts_data = {}
         self.settings = {}

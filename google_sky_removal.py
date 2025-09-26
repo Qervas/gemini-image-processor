@@ -99,35 +99,54 @@ class GoogleSkyRemoval:
             response = model.generate_content([prompt, image])
             print(f"📄 Gemini response received")
 
+            # Robust handling: blocked prompts or empty candidates
+            try:
+                candidates = getattr(response, 'candidates', None)
+                if not candidates:
+                    # Check prompt feedback for block reason
+                    feedback = getattr(response, 'prompt_feedback', None)
+                    block_reason = getattr(feedback, 'block_reason', None)
+                    if block_reason:
+                        raise RuntimeError(f"Prompt blocked by Gemini safety: {block_reason}")
+                    # If no explicit block reason, raise a generic error
+                    raise RuntimeError("Gemini returned no candidates for this request.")
+            except AttributeError:
+                # Older SDKs may not expose candidates; continue gracefully
+                candidates = []
+
             # Handle different response types
             generated_image = None
             response_text = ""
 
-            if hasattr(response, 'parts') and response.parts:
-                print(f"� Response has {len(response.parts)} parts")
-
-                for i, part in enumerate(response.parts):
-                    if hasattr(part, 'text') and part.text:
-                        response_text += part.text
-                        print(f"📝 Part {i} text: {part.text[:100]}...")
-
-                    if hasattr(part, 'inline_data') and part.inline_data:
-                        # This is an image response
-                        try:
-                            from PIL import Image as PILImage
-                            import io
-
-                            image_data = part.inline_data.data
-                            generated_image = PILImage.open(io.BytesIO(image_data))
-                            print(f"🖼️  Part {i} contains generated image: {generated_image.size}")
-                        except Exception as img_error:
-                            print(f"⚠️  Could not process image data in part {i}: {img_error}")
+            # Prefer iterating parts from candidates to avoid quick accessor errors
+            if candidates:
+                for ci, cand in enumerate(candidates):
+                    content = getattr(cand, 'content', None)
+                    parts = getattr(content, 'parts', None)
+                    if not parts:
+                        continue
+                    for i, part in enumerate(parts):
+                        if hasattr(part, 'text') and part.text:
+                            response_text += part.text
+                            print(f"📝 Candidate {ci} part {i} text: {part.text[:100]}...")
+                        # Try inline_data then blob forms
+                        inline = getattr(part, 'inline_data', None)
+                        if inline and getattr(inline, 'data', None):
+                            try:
+                                from PIL import Image as PILImage
+                                import io
+                                image_data = inline.data
+                                generated_image = PILImage.open(io.BytesIO(image_data))
+                                print(f"🖼️  Candidate {ci} part {i} contains generated image: {generated_image.size}")
+                            except Exception as img_error:
+                                print(f"⚠️  Could not process image data in candidate {ci} part {i}: {img_error}")
 
             # Try legacy text extraction
             try:
-                if not response_text:
+                if not response_text and hasattr(response, 'text'):
                     response_text = response.text
-                    print(f"📝 Legacy text response: {response_text[:200]}...")
+                    if response_text:
+                        print(f"📝 Legacy text response: {response_text[:200]}...")
             except Exception as text_error:
                 print(f"⚠️  Could not extract text: {text_error}")
 
@@ -166,6 +185,7 @@ class GoogleSkyRemoval:
             print("Google Generative AI not available. Install with: pip install google-generativeai")
             raise
         except Exception as e:
+            # Surface a clear, user-actionable error message to callers/GUI
             print(f"Gemini segmentation failed: {e}")
             raise
 

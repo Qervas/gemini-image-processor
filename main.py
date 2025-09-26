@@ -18,7 +18,7 @@ def main():
 
     try:
         # Import and run the GUI
-        from gemini_gui import main as gui_main
+        from gui.main_window import main as gui_main
         gui_main()
 
     except ImportError as e:
