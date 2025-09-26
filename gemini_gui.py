@@ -66,30 +66,110 @@ class FolderScannerThread(QThread):
         super().__init__()
         self.folder_path = folder_path
         self.is_cancelled = False
+        self.already_processed = []
 
     def stop(self):
         self.is_cancelled = True
+
+    @staticmethod
+    def _is_result_directory(directory_path: str) -> bool:
+        name = os.path.basename(directory_path.rstrip(os.sep)).lower()
+        return name.endswith("_gemini_results") or "gemini_results" in name
+
+    @staticmethod
+    def _is_result_file(filename: str) -> bool:
+        return "gemini" in filename.lower()
+
+    @staticmethod
+    def _find_existing_result(image_path: str) -> Optional[str]:
+        """Return the path of an existing Gemini result for the given input image, if any."""
+        image_dir = os.path.dirname(image_path)
+        image_name, _ = os.path.splitext(os.path.basename(image_path))
+
+        candidate_dirs = {
+            image_dir,
+            os.path.join(image_dir, f"{image_name}_gemini_results"),
+        }
+
+        parent_dir = os.path.dirname(image_dir)
+        if parent_dir:
+            dir_name = os.path.basename(image_dir)
+            candidate_dirs.add(os.path.join(parent_dir, f"{dir_name}_gemini_results"))
+            candidate_dirs.add(os.path.join(parent_dir, "gemini_results"))
+
+        for directory in list(candidate_dirs):
+            if not directory:
+                continue
+            stem = os.path.join(directory, f"{image_name}_gemini")
+            for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                candidate = stem + ext
+                if os.path.exists(candidate):
+                    return candidate
+        return None
 
     def run(self):
         """Quickly scan folder and return all image paths"""
         image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
         image_files = []
+        skipped_dir_count = 0
+        skipped_file_count = 0
+        already_processed_count = 0
 
         try:
             for root, dirs, files in os.walk(self.folder_path):
                 if self.is_cancelled:
                     break
 
+                if self._is_result_directory(root):
+                    skipped_dir_count += 1
+                    dirs[:] = []
+                    continue
+
+                original_dirs = list(dirs)
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if not self._is_result_directory(os.path.join(root, d))
+                ]
+                skipped_dir_count += len(original_dirs) - len(dirs)
+
                 for file in files:
                     if self.is_cancelled:
                         break
 
-                    if any(file.lower().endswith(ext) for ext in image_extensions):
-                        image_files.append(os.path.join(root, file))
+                    if self._is_result_file(file):
+                        skipped_file_count += 1
+                        continue
+
+                    if not any(file.lower().endswith(ext) for ext in image_extensions):
+                        continue
+
+                    full_path = os.path.join(root, file)
+                    existing_result = self._find_existing_result(full_path)
+                    if existing_result:
+                        already_processed_count += 1
+                        self.already_processed.append((full_path, existing_result))
+                        continue
+
+                    image_files.append(full_path)
 
             if not self.is_cancelled:
+                if skipped_dir_count or skipped_file_count or already_processed_count:
+                    parts = []
+                    if skipped_dir_count:
+                        parts.append(f"{skipped_dir_count} result folder(s)")
+                    if skipped_file_count:
+                        parts.append(f"{skipped_file_count} result file(s)")
+                    if already_processed_count:
+                        parts.append(f"{already_processed_count} previously processed input(s)")
+                    if parts:
+                        if len(parts) > 1:
+                            message = ", ".join(parts[:-1]) + f" and {parts[-1]}"
+                        else:
+                            message = parts[0]
+                        print(f"🔎 Skipped {message} during scan.")
                 self.files_found.emit(image_files)
-                self.scan_finished.emit(len(image_files))
+                self.scan_finished.emit(len(image_files) + already_processed_count)
 
         except Exception as e:
             print(f"Error scanning folder: {e}")
@@ -175,6 +255,24 @@ class ProcessingWorker(QThread):
     def cancel(self):
         self.is_cancelled = True
 
+    def _sleep_with_cancel(self, total_seconds, message=None, poll_interval=0.2):
+        """Sleep in short intervals so cancellation responds quickly."""
+        import time
+
+        if total_seconds <= 0:
+            return True
+
+        if message:
+            self.progress_updated.emit(-1, message)
+
+        end_time = time.time() + total_seconds
+        while not self.is_cancelled:
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval, remaining))
+        return not self.is_cancelled
+
     def _wait_for_rate_limit(self):
         """Wait to respect rate limits between requests"""
         import time
@@ -184,17 +282,15 @@ class ProcessingWorker(QThread):
 
         if time_since_last_request < self.rate_limit_delay:
             wait_time = self.rate_limit_delay - time_since_last_request
-            self.progress_updated.emit(
-                -1,  # Special value to indicate rate limiting
-                f"⏱️  Rate limiting: waiting {wait_time:.1f}s before next request...",
-            )
-            time.sleep(wait_time)
+            message = f"⏱️  Rate limiting: waiting {wait_time:.1f}s before next request..."
+            if not self._sleep_with_cancel(wait_time, message):
+                return False
 
         self.last_request_time = time.time()
+        return True
 
     def _handle_rate_limit_error(self, error, image_path):
         """Handle rate limit errors with exponential backoff"""
-        import time
         import re
 
         error_str = str(error).lower()
@@ -205,13 +301,12 @@ class ProcessingWorker(QThread):
         ):
             self.retry_count += 1
             if self.retry_count <= self.max_retries:
-                # Exponential backoff: 30s, 60s, 120s
                 backoff_time = 30 * (2 ** (self.retry_count - 1))
-                self.progress_updated.emit(
-                    -1,
-                    f"🚦 Rate limit hit! Retrying in {backoff_time}s (attempt {self.retry_count}/{self.max_retries})...",
+                message = (
+                    f"🚦 Rate limit hit! Retrying in {backoff_time}s (attempt {self.retry_count}/{self.max_retries})..."
                 )
-                time.sleep(backoff_time)
+                if not self._sleep_with_cancel(backoff_time, message, poll_interval=0.5):
+                    return False
                 return True  # Retry
             else:
                 self.error_occurred.emit(
@@ -237,12 +332,21 @@ class ProcessingWorker(QThread):
                 try:
                     # Apply rate limiting (skip for first request)
                     if i > 1:
-                        self._wait_for_rate_limit()
+                        if not self._wait_for_rate_limit():
+                            break
+                        if self.is_cancelled:
+                            break
+
+                    if self.is_cancelled:
+                        break
 
                     self.progress_updated.emit(
                         int((i - 1) / total * 100),
                         f"Processing {i}/{total}: {os.path.basename(image_path)}",
                     )
+
+                    if self.is_cancelled:
+                        break
 
                     # Create output path
                     image_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -275,14 +379,24 @@ class ProcessingWorker(QThread):
                     break  # Success, exit retry loop
 
                 except Exception as e:
-                    if self._handle_rate_limit_error(e, image_path):
+                    if self.is_cancelled:
+                        break
+
+                    handled = self._handle_rate_limit_error(e, image_path)
+                    if self.is_cancelled:
+                        break
+
+                    if handled:
                         continue  # Retry after backoff
-                    else:
-                        # Not a rate limit error or max retries exceeded
-                        error_msg = f"Failed to process {os.path.basename(image_path)}: {str(e)}"
-                        self.error_occurred.emit(error_msg, image_path)
-                        results[image_path] = {"success": False, "error": str(e)}
-                        break  # Exit retry loop
+
+                    # Not a rate limit error or max retries exceeded
+                    error_msg = f"Failed to process {os.path.basename(image_path)}: {str(e)}"
+                    self.error_occurred.emit(error_msg, image_path)
+                    results[image_path] = {"success": False, "error": str(e)}
+                    break  # Exit retry loop
+
+            if self.is_cancelled:
+                break
 
         self.progress_updated.emit(100, "Processing complete!")
         self.finished_all.emit(results)
@@ -299,6 +413,8 @@ class GeminiSkyRemovalGUI(QMainWindow):
         self.folder_scanner = None
         self.thumbnail_loader = None
         self.thumbnail_cache = {}  # Cache for loaded thumbnails
+        self.pre_existing_results = {}  # Map of input -> existing output
+        self.failed_inputs = {}  # Map of failed input -> error message
 
         # File tracking
         self.input_files = []  # List of all input image paths
@@ -578,6 +694,13 @@ class GeminiSkyRemovalGUI(QMainWindow):
         self.cancel_btn.clicked.connect(self.cancel_processing)
         layout.addWidget(self.cancel_btn)
 
+        # Retry failed button
+        self.retry_failed_btn = QPushButton("🔁 Retry Failed")
+        self.retry_failed_btn.setEnabled(False)
+        self.retry_failed_btn.setToolTip("No failed images to retry.")
+        self.retry_failed_btn.clicked.connect(self.retry_failed_images)
+        layout.addWidget(self.retry_failed_btn)
+
         # Add stretch to push everything up
         layout.addStretch()
 
@@ -746,6 +869,9 @@ class GeminiSkyRemovalGUI(QMainWindow):
             self.file_list.clear()
             self.file_list.addItem(file_path)
             self.input_files = [file_path]
+            self.pre_existing_results = {}
+            self.failed_inputs = {}
+            self.update_retry_button_state()
             self.update_selection_info()
             self.populate_input_tree()
 
@@ -755,6 +881,9 @@ class GeminiSkyRemovalGUI(QMainWindow):
         if folder_path:
             self.file_list.clear()
             self.input_files = []
+            self.pre_existing_results = {}
+            self.failed_inputs = {}
+            self.update_retry_button_state()
             if hasattr(self, "unified_tree"):
                 self.unified_tree.clear()
 
@@ -770,11 +899,30 @@ class GeminiSkyRemovalGUI(QMainWindow):
 
     def on_folder_scanned(self, image_files: List[str]):
         """Handle scanned image files"""
-        self.input_files = sorted(image_files)
-        # Add to file list for compatibility with processing
-        for img_path in image_files:
+        processed_map = {}
+        if self.folder_scanner and getattr(self.folder_scanner, "already_processed", None):
+            processed_map = {
+                path: result
+                for path, result in self.folder_scanner.already_processed
+                if path and result and os.path.exists(result)
+            }
+        self.pre_existing_results = processed_map
+
+        pending_files = sorted(path for path in image_files if path not in processed_map)
+        self.input_files = pending_files
+
+        for img_path in pending_files:
             self.file_list.addItem(img_path)
+
+        skipped_count = len(processed_map)
+        if skipped_count:
+            message = f"{skipped_count} image{'s' if skipped_count != 1 else ''} already processed and available in results."
+            self.status_bar.showMessage(message)
+        else:
+            self.status_bar.clearMessage()
+
         self.update_selection_info()
+        self.update_retry_button_state()
 
     def on_folder_scan_complete(self, total_files: int):
         """Handle completion of folder scanning"""
@@ -828,6 +976,8 @@ class GeminiSkyRemovalGUI(QMainWindow):
         output_root.setText(2, "0 files")
         output_root.setData(0, Qt.ItemDataRole.UserRole, "output_root")
         self.output_root = output_root
+
+        self.restore_preexisting_results()
 
         # Expand input folder
         input_root.setExpanded(True)
@@ -911,6 +1061,8 @@ class GeminiSkyRemovalGUI(QMainWindow):
 
         self.file_list.clear()
         self.input_files = []
+        self.pre_existing_results = {}
+        self.failed_inputs = {}
         self.output_files = {}
         self.thumbnail_cache.clear()
 
@@ -929,10 +1081,132 @@ class GeminiSkyRemovalGUI(QMainWindow):
 
         self.update_selection_info()
         self.loading_label.setVisible(False)
+        self.update_retry_button_state()
 
     def refresh_dataset_gallery(self):
         """Refresh the dataset view - now handled by tree view"""
         self.populate_input_tree()
+
+    def restore_preexisting_results(self):
+        """Populate the output tree with results detected during scanning."""
+        if not self.pre_existing_results:
+            return
+
+        for input_path, output_path in self.pre_existing_results.items():
+            if not output_path or not os.path.exists(output_path):
+                continue
+            if input_path in self.output_files and self.output_files[input_path] == output_path:
+                continue
+            self.add_result_to_tree(input_path, output_path)
+
+        self.update_retry_button_state()
+
+    def update_retry_button_state(self):
+        """Enable or disable the retry button based on failure state."""
+        if hasattr(self, "retry_failed_btn"):
+            has_failed = bool(self.failed_inputs)
+            self.retry_failed_btn.setEnabled(has_failed)
+            if has_failed:
+                self.retry_failed_btn.setToolTip("Retry processing for failed images.")
+            else:
+                self.retry_failed_btn.setToolTip("No failed images to retry.")
+
+    def remove_error_entry(self, image_path: str):
+        """Remove a failure entry from the error folder if present."""
+        if not hasattr(self, "output_root"):
+            return
+        error_dir = None
+        for i in range(self.output_root.childCount()):
+            child = self.output_root.child(i)
+            if child.data(0, Qt.ItemDataRole.UserRole) == "errors" or child.text(0) == "❌ Errors":
+                error_dir = child
+                break
+
+        if not error_dir:
+            return
+
+        removed = False
+        for j in range(error_dir.childCount()):
+            item = error_dir.child(j)
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(data, tuple) and data[0] == "error" and data[1] == image_path:
+                error_dir.takeChild(j)
+                removed = True
+                break
+
+        if removed and error_dir.childCount() == 0:
+            idx = self.output_root.indexOfChild(error_dir)
+            if idx != -1:
+                self.output_root.takeChild(idx)
+
+    def set_error_entry_status(self, image_path: str, status: str, symbol: str):
+        """Update the error entry display for a given image if it exists."""
+        if not hasattr(self, "output_root"):
+            return
+
+        error_dir = None
+        for i in range(self.output_root.childCount()):
+            child = self.output_root.child(i)
+            if child.data(0, Qt.ItemDataRole.UserRole) == "errors" or child.text(0) == "❌ Errors":
+                error_dir = child
+                break
+
+        if not error_dir:
+            return
+
+        for j in range(error_dir.childCount()):
+            item = error_dir.child(j)
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(data, tuple) and data[0] == "error" and data[1] == image_path:
+                item.setText(1, status)
+                item.setText(2, symbol)
+                return
+
+    def retry_failed_images(self):
+        """Retry processing for the images that previously failed."""
+        if not self.failed_inputs:
+            QMessageBox.information(
+                self,
+                "No Failed Images",
+                "There are no failed images to retry.",
+            )
+            return
+
+        existing = []
+        missing = []
+        for path in list(self.failed_inputs.keys()):
+            if os.path.exists(path):
+                existing.append(path)
+            else:
+                missing.append(path)
+                del self.failed_inputs[path]
+                self.remove_error_entry(path)
+
+        if missing:
+            missing_display = "\n".join(os.path.basename(p) or p for p in missing)
+            QMessageBox.warning(
+                self,
+                "Missing Files",
+                "The following failed images could not be retried because the files were not found:\n"
+                + missing_display,
+            )
+
+        if not existing:
+            self.update_retry_button_state()
+            self.status_bar.showMessage("No failed images available for retry.")
+            return
+
+        for path in existing:
+            self.update_input_status(path, "Retrying")
+            self.set_error_entry_status(path, "Retrying", "⏳")
+
+        if hasattr(self, "retry_failed_btn"):
+            self.retry_failed_btn.setEnabled(False)
+
+        self.start_processing(image_paths=existing, preserve_outputs=True)
+
+        # Button state will refresh when processing completes
+
 
     def add_result_to_tree(self, input_path: str, output_path: str):
         """Add processed result to unified tree"""
@@ -972,6 +1246,48 @@ class GeminiSkyRemovalGUI(QMainWindow):
             processed_count = len(self.output_files)
             self.output_count_label.setText(f"Output: {processed_count}")
 
+    def get_expected_output_path(self, image_path: str, output_dir: Optional[str]) -> Optional[str]:
+        """Return the expected Gemini output path for a given image."""
+        image_name = os.path.splitext(os.path.basename(image_path))[0]
+        if output_dir:
+            return os.path.join(output_dir, f"{image_name}_gemini.jpg")
+        if output_dir == "":
+            return os.path.join(os.getcwd(), f"{image_name}_gemini.jpg")
+        default_dir = os.path.join(os.path.dirname(image_path), f"{image_name}_gemini_results")
+        return os.path.join(default_dir, f"{image_name}_gemini.jpg")
+
+    def filter_existing_outputs(self, image_paths, output_dir):
+        """Split image paths into pending and already processed based on local files."""
+        pending = []
+        skipped = []
+        for image_path in image_paths:
+            expected_output = self.get_expected_output_path(image_path, output_dir)
+            if expected_output and os.path.exists(expected_output):
+                skipped.append((image_path, expected_output))
+            else:
+                pending.append(image_path)
+        return pending, skipped
+
+    def update_input_status(self, image_path: str, status: str):
+        """Update the status column for a queued input file."""
+        if not hasattr(self, "unified_tree"):
+            return
+        for i in range(self.unified_tree.topLevelItemCount()):
+            root_item = self.unified_tree.topLevelItem(i)
+            if root_item.data(0, Qt.ItemDataRole.UserRole) != "input_root":
+                continue
+            for dir_index in range(root_item.childCount()):
+                dir_item = root_item.child(dir_index)
+                for file_index in range(dir_item.childCount()):
+                    file_item = dir_item.child(file_index)
+                    data = file_item.data(0, Qt.ItemDataRole.UserRole)
+                    if (
+                        isinstance(data, tuple)
+                        and data[0] == "input"
+                        and data[1] == image_path
+                    ):
+                        file_item.setText(2, status)
+                        return
     def update_selection_info(self):
         """Update the selection info label"""
         count = self.file_list.count()
@@ -1019,7 +1335,7 @@ class GeminiSkyRemovalGUI(QMainWindow):
                 "Please check your prompts.json file.",
             )
 
-    def start_processing(self):
+    def start_processing(self, checked=False, *, image_paths=None, preserve_outputs=False):
         """Start the processing"""
         if not self.api_status:
             QMessageBox.warning(
@@ -1029,10 +1345,13 @@ class GeminiSkyRemovalGUI(QMainWindow):
             )
             return
 
-        # Get selected files
-        image_paths = []
-        for i in range(self.file_list.count()):
-            image_paths.append(self.file_list.item(i).text())
+        if image_paths is None:
+            image_paths = [
+                self.file_list.item(i).text()
+                for i in range(self.file_list.count())
+            ]
+        else:
+            image_paths = list(dict.fromkeys(path for path in image_paths if path))
 
         if not image_paths:
             QMessageBox.warning(
@@ -1040,42 +1359,37 @@ class GeminiSkyRemovalGUI(QMainWindow):
             )
             return
 
-        # Generate output directory automatically
+        output_dir = None
         if self.auto_save.isChecked():
             if len(image_paths) == 1:
-                # Single file: create output dir next to input file
                 input_dir = os.path.dirname(image_paths[0])
                 input_filename = os.path.splitext(os.path.basename(image_paths[0]))[0]
-                output_dir = os.path.join(input_dir, f"{input_filename}_gemini_results")
+                output_dir = os.path.join(
+                    input_dir, f"{input_filename}_gemini_results"
+                )
             else:
-                # Batch processing: create output dir next to input folder
-                # Find common parent directory of all files
                 input_dirs = set(os.path.dirname(path) for path in image_paths)
                 if len(input_dirs) == 1:
-                    # All files in same directory
                     input_dir = list(input_dirs)[0]
                     output_dir = os.path.join(
                         os.path.dirname(input_dir),
                         f"{os.path.basename(input_dir)}_gemini_results",
                     )
                 else:
-                    # Files in different directories - use parent of first file
                     first_input_dir = os.path.dirname(image_paths[0])
                     output_dir = os.path.join(
-                        os.path.dirname(first_input_dir), "gemini_results"
+                        os.path.dirname(first_input_dir),
+                        "gemini_results",
                     )
 
-            # Create the output directory if it doesn't exist
             os.makedirs(output_dir, exist_ok=True)
             print(f"📁 Auto-created output directory: {output_dir}")
             self.status_bar.showMessage(
                 f"Output directory created: {os.path.basename(output_dir)}"
             )
-
         else:
             output_dir = None
 
-        # Get prompt type from current preset selection
         current_preset = self.preset_combo.currentText()
         preset_to_type = {
             "Default Sky Removal": "default",
@@ -1087,7 +1401,6 @@ class GeminiSkyRemovalGUI(QMainWindow):
         }
         prompt_type = preset_to_type.get(current_preset, "default")
 
-        # Get custom prompt if user edited it
         current_prompt_text = self.prompt_edit.toPlainText().strip()
         default_prompt = ""
         if self.prompt_processor:
@@ -1096,24 +1409,64 @@ class GeminiSkyRemovalGUI(QMainWindow):
             except:
                 default_prompt = ""
 
-        # Prepare prompt kwargs
         prompt_kwargs = {}
 
-        # If user modified the prompt, use custom mode
         if current_prompt_text != default_prompt and current_prompt_text:
             prompt_type = "custom"
             prompt_kwargs["custom_prompt"] = current_prompt_text
 
-        # Update UI
+        if preserve_outputs:
+            self.status_bar.showMessage("Retrying failed images...")
+        else:
+            self.clear_results()
+            self.restore_preexisting_results()
+
+        pending_paths, skipped_outputs = self.filter_existing_outputs(
+            image_paths, output_dir
+        )
+
+        skip_message = None
+        if skipped_outputs:
+            for input_path, output_path in skipped_outputs:
+                self.update_input_status(input_path, "Skipped")
+                if input_path in self.failed_inputs:
+                    del self.failed_inputs[input_path]
+                    self.remove_error_entry(input_path)
+                if input_path not in self.output_files:
+                    self.add_result_to_tree(input_path, output_path)
+            self.update_retry_button_state()
+            skipped_count = len(skipped_outputs)
+            skip_message = (
+                f"Skipped {skipped_count} already processed image"
+                f"{'s' if skipped_count != 1 else ''}."
+            )
+            print(f"🔄 {skip_message}")
+            if output_dir:
+                self.status_bar.showMessage(
+                    f"{skip_message} • Output: {os.path.basename(output_dir)}"
+                )
+            else:
+                self.status_bar.showMessage(skip_message)
+
+        if not pending_paths:
+            if not skip_message:
+                self.status_bar.showMessage("No images to process.")
+            QMessageBox.information(
+                self,
+                "Nothing to Process",
+                "All selected images already have Gemini results. Nothing new to process.",
+            )
+            return
+
+        image_paths = pending_paths
+        for path in image_paths:
+            self.update_input_status(path, "Queued")
+
         self.process_btn.setEnabled(False)
         self.cancel_btn.setVisible(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
 
-        # Clear previous results
-        self.clear_results()
-
-        # Start processing thread
         # Map selected tier to delay
         if self.tier_radio_t3.isChecked():
             rate_limit_delay = self.tiers["tier3"]["delay"]
@@ -1121,6 +1474,7 @@ class GeminiSkyRemovalGUI(QMainWindow):
             rate_limit_delay = self.tiers["tier1"]["delay"]
         else:
             rate_limit_delay = self.tiers["free"]["delay"]
+
         self.current_worker = ProcessingWorker(
             self.sky_remover,
             image_paths,
@@ -1155,19 +1509,28 @@ class GeminiSkyRemovalGUI(QMainWindow):
         # Add to output tree
         self.add_result_to_tree(input_path, output_path)
 
+        if input_path in self.failed_inputs:
+            del self.failed_inputs[input_path]
+            self.remove_error_entry(input_path)
+            self.update_retry_button_state()
+        self.update_input_status(input_path, "Done")
+
         # Cache the result pixmap for preview
         if pixmap and not pixmap.isNull():
             self.thumbnail_cache[output_path] = pixmap
 
     def handle_error(self, error_msg, image_path):
-        # Handle processing errors"""
-        # Add error entry to unified tree if available
+        """Handle processing errors"""
+        self.failed_inputs[image_path] = error_msg
+        self.update_input_status(image_path, "Failed")
+        self.remove_error_entry(image_path)
+
         if hasattr(self, "output_root"):
             # Find or create error folder
             error_dir = None
             for i in range(self.output_root.childCount()):
                 child = self.output_root.child(i)
-                if child.text(0) == "❌ Errors":
+                if child.text(0) == "❌ Errors" or child.data(0, Qt.ItemDataRole.UserRole) == "errors":
                     error_dir = child
                     break
 
@@ -1178,15 +1541,20 @@ class GeminiSkyRemovalGUI(QMainWindow):
                 error_dir.setText(2, "")
                 error_dir.setData(0, Qt.ItemDataRole.UserRole, "errors")
 
-            # Add error file
+            # Add error file entry
             file_item = QTreeWidgetItem(error_dir)
             file_item.setText(0, os.path.basename(image_path))
             file_item.setText(1, "Failed")
             file_item.setText(2, "❌")
             file_item.setData(0, Qt.ItemDataRole.UserRole, ("error", image_path))
+            file_item.setToolTip(0, error_msg)
+            file_item.setToolTip(1, error_msg)
+            file_item.setToolTip(2, error_msg)
 
             error_dir.setExpanded(True)
             self.output_root.setExpanded(True)
+
+        self.update_retry_button_state()
 
     def processing_finished(self, results):
         """Handle processing completion"""
@@ -1208,6 +1576,7 @@ class GeminiSkyRemovalGUI(QMainWindow):
         )
 
         self.current_worker = None
+        self.update_retry_button_state()
 
     def clear_results(self):
         """Clear all results from the UI"""
@@ -1217,11 +1586,13 @@ class GeminiSkyRemovalGUI(QMainWindow):
                 while self.output_root.childCount() > 0:
                     self.output_root.takeChild(0)
                 self.output_root.setText(2, "0 files")
+        output_paths = list(self.output_files.values())
         self.output_files = {}
+        self.failed_inputs = {}
         self.output_count_label.setText("Output: 0")
+        self.update_retry_button_state()
 
         # Clear output thumbnails from cache
-        output_paths = list(self.output_files.values())
         for path in output_paths:
             if path in self.thumbnail_cache:
                 del self.thumbnail_cache[path]
